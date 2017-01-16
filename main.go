@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -16,16 +18,17 @@ import (
 
 var sites = []string{
 	"http://ifconfig.me/ip",
-	"https://api.ipify.org",
-	"http://ipv4bot.whatismyipaddress.com",
+	"https://ifconfig.co/",
+	"https://api.ipify.org/",
+	"http://ipv4bot.whatismyipaddress.com/",
 }
 
 type Ana struct {
 	Session *session.Session
 }
 
-func newAna(awsAccessKeyId, awsSecretAccessKey, awsRegion string) *Ana {
-	creds := credentials.NewStaticCredentials(awsAccessKeyId, awsSecretAccessKey, "")
+func newAna(awsAccessKeyID, awsSecretAccessKey, awsRegion string) *Ana {
+	creds := credentials.NewStaticCredentials(awsAccessKeyID, awsSecretAccessKey, "")
 	sess := session.New(&aws.Config{
 		Region:      aws.String(awsRegion),
 		Credentials: creds,
@@ -48,7 +51,7 @@ func (ana *Ana) open(cidr, securityGroupID string) error {
 
 	if err != nil {
 		if strings.Contains(err.Error(), "InvalidPermission.Duplicate") {
-			fmt.Printf("%s:22 is already opened", cidr)
+			fmt.Printf("%s:22 is already opened\n", cidr)
 			return nil
 		}
 		return err
@@ -79,33 +82,53 @@ func (ana *Ana) close(cidr, securityGroupID string) error {
 	return nil
 }
 
-func getIPAddress(url string) (string, error) {
+func getIPAddress(ctx context.Context, url string) (string, error) {
 
-	res, _ := http.Get(url)
-	ip, _ := ioutil.ReadAll(res.Body)
-	return string(ip), nil
+	tr := &http.Transport{}
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequest("GET", url, nil)
+
+	if err != nil {
+		return "", err
+	}
+
+	errCh := make(chan error)
+	ipCh := make(chan string)
+	go func() {
+		res, err := client.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		ip, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		ipCh <- string(ip)
+	}()
+
+	select {
+	case ip := <-ipCh:
+		return string(ip), nil
+	case err := <-errCh:
+		return "", err
+	case <-ctx.Done():
+		tr.CancelRequest(req)
+		<-errCh
+		return "", ctx.Err()
+	}
 }
 
 func main() {
 
 	securityGroupID := os.Getenv("AWS_SECURITY_GROUP_ID")
-	if securityGroupID == "" {
-		fmt.Println("set AWS_SECURITY_GROUP_ID")
-		return
-	}
-	awsAccessKeyId := os.Getenv("AWS_ACCESS_KEY_ID")
-	if awsAccessKeyId == "" {
-		fmt.Println("set AWS_ACCESS_KEY_ID")
-		return
-	}
+	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
 	awsSecretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	if awsSecretAccessKey == "" {
-		fmt.Println("set AWS_SECRET_ACCESS_KEY")
-		return
-	}
 	awsRegion := os.Getenv("AWS_REGION")
-	if awsRegion == "" {
-		fmt.Println("set AWS_REGION")
+	if securityGroupID == "" || awsAccessKeyID == "" || awsSecretAccessKey == "" || awsRegion == "" {
+		fmt.Println("set AWS_SECURITY_GROUP_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION")
 		return
 	}
 
@@ -116,39 +139,68 @@ func main() {
 	op := os.Args[1]
 
 	ipCh := make(chan string)
+	errCh := make(chan error)
+	findCh := make(chan bool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5000*time.Millisecond)
+	defer cancel()
 
 	for _, site := range sites {
 		go func(siteUrl string) {
-			ip, _ := getIPAddress(site)
-			if net.ParseIP(ip) == nil {
-				return
+			ip, err := getIPAddress(ctx, siteUrl)
+			if err != nil {
+				errCh <- err
+			} else {
+				ipCh <- ip
 			}
-			ipCh <- ip
 		}(site)
 	}
 
 	var myIP string
-	select {
-	case ip := <-ipCh:
-		myIP = ip
+	go func() {
+		for i := 0; i < len(sites); i++ {
+			select {
+			case ip := <-ipCh:
+				trimmedIP := strings.TrimSpace(ip)
+				if net.ParseIP(trimmedIP) == nil {
+					fmt.Printf("Skipping... ip [%s] invalid\n", ip)
+					continue
+				}
+				myIP = trimmedIP
+				findCh <- true
+				return
+			case err := <-errCh:
+				fmt.Printf("Skipping... %s\n", err.Error())
+			}
+		}
+		findCh <- false
+	}()
+
+	find := <-findCh
+	if find == false || myIP == "" {
+		fmt.Println("Could not get ip address")
+		return
 	}
 
-	cidr := fmt.Sprintf("%s/32", myIP)
-	ana := newAna(awsAccessKeyId, awsSecretAccessKey, awsRegion)
-
 	var err error
+	cidr := fmt.Sprintf("%s/32", myIP)
+
+	fmt.Printf("Trying to %s %s...\n", op, cidr)
+	ana := newAna(awsAccessKeyID, awsSecretAccessKey, awsRegion)
+
 	switch op {
 	case "open":
 		err = ana.open(cidr, securityGroupID)
 	case "close":
 		err = ana.close(cidr, securityGroupID)
 	default:
+		fmt.Println("args must be 'open' or 'close'")
 		return
 	}
 
 	if err != nil {
 		fmt.Println(err)
 	} else {
-		fmt.Printf("%s success", op)
+		fmt.Printf("%s success\n", op)
 	}
 }
