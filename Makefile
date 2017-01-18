@@ -9,7 +9,9 @@ deps:
 build: deps
 	for i in $(GOOS); do \
 		GOOS=$$i GOARCH=$(GOARCH) go build -o bin/ana_$$i; \
-		zip bin/ana_$$i.zip bin/ana_$$i; \
+		cd bin/; \
+		zip ana_$$i.zip ana_$$i; \
+		cd -; \
 	done
 
 install:
